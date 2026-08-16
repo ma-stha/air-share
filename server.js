@@ -9,24 +9,28 @@ const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: { origin: '*' },
+  maxHttpBufferSize: 1e8 // 100 MB buffer
+});
 
-// Directory where files are uploaded
+// Uploads directory configuration
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR);
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-// In-memory database of rooms and files
-// format: { roomId: [ { id: fileId, name: originalName, size: file.size, filename: file.filename, uploadedAt: timestamp } ] }
+// In-memory data store
+// roomsData: { [roomId]: [ { id, name, size, mimeType, filename, uploadedAt } ] }
 const roomsData = {};
+// activePeers: { [roomId]: { [socketId]: deviceInfo } }
+const activePeers = {};
 
-// Helper to get local IP address
+// Helper to get local network IP address
 function getLocalIp() {
   const interfaces = os.networkInterfaces();
   for (const name of Object.keys(interfaces)) {
     for (const net of interfaces[name]) {
-      // skip internal (i.e. 127.0.0.1) and non-ipv4 addresses
       if (net.family === 'IPv4' && !net.internal) {
         return net.address;
       }
@@ -43,14 +47,13 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) => {
     const fileId = uuidv4();
     const originalName = file.originalname;
-    // Prefix with a UUID to prevent collisions
     cb(null, `${fileId}-${originalName}`);
   }
 });
 
-const upload = multer({ 
+const upload = multer({
   storage,
-  limits: { fileSize: 500 * 1024 * 1024 } // 500 MB limit
+  limits: { fileSize: 2000 * 1024 * 1024 } // 2 GB limit for server upload fallback
 });
 
 // Middlewares
@@ -72,7 +75,7 @@ app.get('/api/room/:roomId/files', (req, res) => {
   res.json(roomsData[roomId] || []);
 });
 
-// Upload endpoint
+// Upload endpoint (Async / Server Relay fallback)
 app.post('/api/upload', upload.single('file'), (req, res) => {
   const { roomId } = req.body;
   const file = req.file;
@@ -88,6 +91,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     id: fileId,
     name: originalName,
     size: file.size,
+    mimeType: file.mimetype || 'application/octet-stream',
     filename: file.filename,
     uploadedAt: Date.now()
   };
@@ -97,39 +101,149 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   }
   roomsData[roomId].push(fileData);
 
-  // Notify socket room that a new file is available
+  // Notify all sockets in room
   io.to(roomId).emit('file-shared', fileData);
 
   res.status(200).json({ success: true, file: fileData });
 });
 
-// Download endpoint
+// High performance stream / range download endpoint
 app.get('/api/download/:filename', (req, res) => {
   const filename = req.params.filename;
   const filePath = path.join(UPLOADS_DIR, filename);
 
-  if (fs.existsSync(filePath)) {
-    const originalName = filename.substring(37);
-    res.download(filePath, originalName);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).send('File not found or expired.');
+  }
+
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const originalName = filename.length > 37 ? filename.substring(37) : filename;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = (end - start) + 1;
+    const fileStream = fs.createReadStream(filePath, { start, end });
+
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunksize,
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(originalName)}"`
+    });
+    fileStream.pipe(res);
   } else {
-    res.status(404).send('File not found or expired.');
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(originalName)}"`
+    });
+    fs.createReadStream(filePath).pipe(res);
   }
 });
 
-// Socket.IO signaling
+// WebRTC Signaling & Room Socket Management
 io.on('connection', (socket) => {
-  socket.on('join-room', (roomId) => {
+  let currentRoom = null;
+  let currentPeerInfo = null;
+
+  socket.on('join-room', ({ roomId, deviceInfo }) => {
+    if (!roomId) return;
+
+    currentRoom = roomId;
+    currentPeerInfo = {
+      peerId: socket.id,
+      deviceName: deviceInfo?.name || 'Unknown Device',
+      deviceType: deviceInfo?.type || 'desktop',
+      browser: deviceInfo?.browser || 'Browser',
+      os: deviceInfo?.os || 'OS',
+      joinedAt: Date.now()
+    };
+
     socket.join(roomId);
-    console.log(`[Socket] User ${socket.id} joined room ${roomId}`);
+
+    if (!activePeers[roomId]) {
+      activePeers[roomId] = {};
+    }
+
+    // Existing peers in this room
+    const existingPeers = Object.values(activePeers[roomId]);
+
+    // Add this socket to active peers list
+    activePeers[roomId][socket.id] = currentPeerInfo;
+
+    // Send existing peers list to newly joined peer
+    socket.emit('room-peers', existingPeers);
+
+    // Notify other peers in room about new peer
+    socket.to(roomId).emit('peer-joined', currentPeerInfo);
+
+    console.log(`[Socket] ${currentPeerInfo.deviceName} (${socket.id}) joined room "${roomId}"`);
   });
 
+  // WebRTC P2P Signaling Relays
+  socket.on('p2p-signal', ({ targetPeerId, signal }) => {
+    io.to(targetPeerId).emit('p2p-signal', {
+      senderPeerId: socket.id,
+      signal
+    });
+  });
+
+  socket.on('p2p-offer', ({ targetPeerId, offer, fileMeta }) => {
+    io.to(targetPeerId).emit('p2p-offer', {
+      senderPeerId: socket.id,
+      offer,
+      fileMeta
+    });
+  });
+
+  socket.on('p2p-answer', ({ targetPeerId, answer }) => {
+    io.to(targetPeerId).emit('p2p-answer', {
+      senderPeerId: socket.id,
+      answer
+    });
+  });
+
+  socket.on('p2p-ice-candidate', ({ targetPeerId, candidate }) => {
+    io.to(targetPeerId).emit('p2p-ice-candidate', {
+      senderPeerId: socket.id,
+      candidate
+    });
+  });
+
+  // Text / Clipboard Beam feature
+  socket.on('send-text-beam', ({ roomId, text }) => {
+    if (!text || !roomId) return;
+    const payload = {
+      id: uuidv4(),
+      text,
+      senderPeerId: socket.id,
+      senderName: currentPeerInfo?.deviceName || 'Peer',
+      timestamp: Date.now()
+    };
+    io.to(roomId).emit('text-beam-received', payload);
+  });
+
+  // Clean disconnect
   socket.on('disconnect', () => {
-    console.log(`[Socket] User ${socket.id} disconnected`);
+    if (currentRoom && activePeers[currentRoom]) {
+      delete activePeers[currentRoom][socket.id];
+      if (Object.keys(activePeers[currentRoom]).length === 0) {
+        delete activePeers[currentRoom];
+      } else {
+        io.to(currentRoom).emit('peer-left', { peerId: socket.id });
+      }
+    }
+    console.log(`[Socket] Peer ${socket.id} disconnected`);
   });
 });
 
-// File Expiration Cleanup (removes files older than 1 hour, runs every 2 minutes)
-const FILE_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
+// File Expiration Cleanup (Every 2 mins, delete files older than 1 hour)
+const FILE_EXPIRY_MS = 60 * 60 * 1000;
 setInterval(() => {
   const now = Date.now();
   for (const roomId of Object.keys(roomsData)) {
@@ -154,14 +268,14 @@ setInterval(() => {
   }
 }, 2 * 60 * 1000);
 
-// Start server
+// Start Server
 const PORT = process.env.PORT || 3000;
 const localIp = getLocalIp();
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`==================================================`);
-  console.log(`File Share server running locally:`);
-  console.log(`  Local:   http://localhost:${PORT}`);
-  console.log(`  Network: http://${localIp}:${PORT}`);
+  console.log(`🚀 AirShare Pro Transfer Server Active`);
+  console.log(`  Local Access:   http://localhost:${PORT}`);
+  console.log(`  Network Access: http://${localIp}:${PORT}`);
   console.log(`==================================================`);
 });
