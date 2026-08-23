@@ -141,8 +141,8 @@ function initializeSocket() {
   socket = io();
 
   socket.on('connect', () => {
-    statusDot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-sm shadow-emerald-400/50';
-    statusText.textContent = 'P2P Ready';
+    statusDot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 status-glow';
+    statusText.textContent = 'Connected';
     
     // Join room with device info
     socket.emit('join-room', { roomId, deviceInfo });
@@ -825,7 +825,7 @@ function setupEventListeners() {
   ['dragenter', 'dragover'].forEach(name => {
     p2pDropZone.addEventListener(name, (e) => {
       e.preventDefault();
-      p2pDropZone.classList.add('border-brand-500', 'bg-brand-500/10');
+      p2pDropZone.classList.add('drop-active');
     });
     vaultDropZone.addEventListener(name, (e) => {
       e.preventDefault();
@@ -836,7 +836,7 @@ function setupEventListeners() {
   ['dragleave', 'drop'].forEach(name => {
     p2pDropZone.addEventListener(name, (e) => {
       e.preventDefault();
-      p2pDropZone.classList.remove('border-brand-500', 'bg-brand-500/10');
+      p2pDropZone.classList.remove('drop-active');
     });
     vaultDropZone.addEventListener(name, (e) => {
       e.preventDefault();
@@ -869,11 +869,15 @@ function setupTabNavigation() {
         t.btn.classList.remove('active');
         t.btn.classList.add('text-slate-400');
         t.section.classList.add('hidden');
+        t.section.classList.remove('section-enter');
       });
 
       btn.classList.add('active');
       btn.classList.remove('text-slate-400');
       section.classList.remove('hidden');
+      // Trigger reflow then add animation class
+      void section.offsetWidth;
+      section.classList.add('section-enter');
     });
   });
 }
@@ -899,13 +903,14 @@ function showToast(message, type = 'info') {
   const toast = document.createElement('div');
   
   const colors = {
-    info: 'bg-slate-900 border-brand-500/50 text-slate-100',
-    success: 'bg-slate-900 border-emerald-500/50 text-emerald-300',
-    warning: 'bg-slate-900 border-amber-500/50 text-amber-300',
-    error: 'bg-slate-900 border-rose-500/50 text-rose-300'
+    info: 'bg-slate-900 border-slate-800 text-slate-100',
+    success: 'bg-slate-900 border-slate-800 text-emerald-300',
+    warning: 'bg-slate-900 border-slate-800 text-amber-300',
+    error: 'bg-slate-900 border-slate-800 text-rose-300'
   };
 
-  toast.className = `toast glass-panel p-3.5 rounded-2xl border text-xs font-semibold shadow-2xl flex items-center gap-2 max-w-sm ${colors[type] || colors.info}`;
+  const toastTypeClass = `toast-${type}`;
+  toast.className = `toast glass-panel p-3.5 rounded-2xl border text-xs font-semibold shadow-2xl flex items-center gap-2 max-w-sm ${colors[type] || colors.info} ${toastTypeClass}`;
   toast.innerHTML = `<span>${message}</span>`;
 
   container.appendChild(toast);
