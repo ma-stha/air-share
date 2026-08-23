@@ -228,6 +228,34 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('text-beam-received', payload);
   });
 
+  // ── Socket.IO File Relay (fallback when WebRTC DataChannel fails) ──
+  socket.on('relay-file-meta', (meta) => {
+    if (!currentRoom) return;
+    socket.to(currentRoom).emit('relay-file-meta', {
+      ...meta,
+      senderPeerId: socket.id,
+      senderName: currentPeerInfo?.deviceName || 'Peer'
+    });
+  });
+
+  socket.on('relay-file-chunk', ({ transferId, chunk, chunkIndex }) => {
+    if (!currentRoom) return;
+    socket.to(currentRoom).emit('relay-file-chunk', {
+      transferId,
+      chunk,
+      chunkIndex,
+      senderPeerId: socket.id
+    });
+  });
+
+  socket.on('relay-file-complete', ({ transferId }) => {
+    if (!currentRoom) return;
+    socket.to(currentRoom).emit('relay-file-complete', {
+      transferId,
+      senderPeerId: socket.id
+    });
+  });
+
   // Clean disconnect
   socket.on('disconnect', () => {
     if (currentRoom && activePeers[currentRoom]) {

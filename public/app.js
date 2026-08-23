@@ -215,12 +215,60 @@ function initializeSocket() {
   // Server Room Updates
   socket.on('file-shared', (fileData) => {
     addVaultFileToUI(fileData);
-    showToast(`📁 New file available in Room Vault: ${fileData.name}`, 'info');
+    showToast(`New file in Room Vault: ${fileData.name}`, 'info');
   });
 
   socket.on('text-beam-received', (payload) => {
     addTextBeamToFeed(payload);
-    showToast(`📝 Text beam received from ${payload.senderName}`, 'success');
+    showToast(`Text received from ${payload.senderName}`, 'success');
+  });
+
+  // ── Socket.IO Relay Receive Handlers (fallback when WebRTC unavailable) ──
+  socket.on('relay-file-meta', (meta) => {
+    if (meta.senderPeerId === socket.id) return; // ignore own
+    receivingTransfers.set(meta.transferId, {
+      transferId: meta.transferId,
+      name: meta.name,
+      size: meta.size,
+      mimeType: meta.mimeType,
+      totalChunks: meta.totalChunks,
+      chunks: [],
+      receivedBytes: 0,
+      startTime: Date.now(),
+      senderName: meta.senderName || 'Peer'
+    });
+    showP2PProgress(meta.name, meta.senderName);
+  });
+
+  socket.on('relay-file-chunk', ({ transferId, chunk, senderPeerId }) => {
+    if (senderPeerId === socket.id) return;
+    const transfer = receivingTransfers.get(transferId);
+    if (!transfer) return;
+
+    // chunk arrives as ArrayBuffer or base64 string
+    let buffer;
+    if (typeof chunk === 'string') {
+      const binary = atob(chunk);
+      buffer = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) buffer[i] = binary.charCodeAt(i);
+      buffer = buffer.buffer;
+    } else {
+      buffer = chunk;
+    }
+
+    transfer.chunks.push(buffer);
+    transfer.receivedBytes += buffer.byteLength;
+
+    const percent = Math.min(100, Math.round((transfer.receivedBytes / transfer.size) * 100));
+    const elapsed = (Date.now() - transfer.startTime) / 1000;
+    const speed = elapsed > 0 ? transfer.receivedBytes / elapsed : 0;
+    const etaSeconds = speed > 0 ? Math.ceil((transfer.size - transfer.receivedBytes) / speed) : 0;
+    updateP2PProgressUI(percent, speed, transfer.receivedBytes, transfer.size, etaSeconds);
+  });
+
+  socket.on('relay-file-complete', ({ transferId, senderPeerId }) => {
+    if (senderPeerId === socket.id) return;
+    finalizeP2PFile(transferId);
   });
 }
 
@@ -412,13 +460,19 @@ function finalizeP2PFile(transferId) {
   }, 2000);
 }
 
-// 6. Sending Files via WebRTC DataChannel (With Backpressure Flow Control)
-async function sendFileViaP2P(file, targetPeerId = null) {
-  const targets = targetPeerId ? [targetPeerId] : Array.from(dataChannels.keys());
+// 6. Sending Files — WebRTC DataChannel with Socket.IO relay fallback
+function hasOpenDataChannel() {
+  for (const [, dc] of dataChannels) {
+    if (dc.readyState === 'open') return true;
+  }
+  return false;
+}
 
-  if (targets.length === 0) {
-    showToast('No active WebRTC peer connected! Falling back to Room Vault upload...', 'warning');
-    uploadToVault(file);
+async function sendFileViaP2P(file, targetPeerId = null) {
+  const useRelay = !hasOpenDataChannel();
+
+  if (useRelay && activePeers.size === 0) {
+    showToast('No devices connected. Open this room on another device first.', 'warning');
     return;
   }
 
@@ -433,7 +487,58 @@ async function sendFileViaP2P(file, targetPeerId = null) {
     totalChunks
   };
 
-  showP2PProgress(file.name, 'All Peers');
+  const mode = useRelay ? 'Server relay' : 'P2P direct';
+  showP2PProgress(file.name, mode);
+
+  if (useRelay) {
+    // ── Socket.IO relay path ──
+    socket.emit('relay-file-meta', fileMeta);
+
+    const startTime = Date.now();
+    let offset = 0;
+    let chunkIndex = 0;
+
+    const sendRelayChunk = () => {
+      if (offset >= file.size) {
+        socket.emit('relay-file-complete', { transferId });
+        showToast(`Transfer complete: ${file.name}`, 'success');
+        setTimeout(() => p2pProgressCard.classList.add('hidden'), 2000);
+        return;
+      }
+
+      const slice = file.slice(offset, offset + CHUNK_SIZE);
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const chunkBuffer = e.target.result;
+        // Convert to base64 for Socket.IO transport
+        const bytes = new Uint8Array(chunkBuffer);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+        const base64 = btoa(binary);
+
+        socket.emit('relay-file-chunk', { transferId, chunk: base64, chunkIndex });
+
+        offset += slice.size;
+        chunkIndex++;
+
+        const percent = Math.min(100, Math.round((offset / file.size) * 100));
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speed = elapsed > 0 ? offset / elapsed : 0;
+        const etaSeconds = speed > 0 ? Math.ceil((file.size - offset) / speed) : 0;
+        updateP2PProgressUI(percent, speed, offset, file.size, etaSeconds);
+
+        // Throttle slightly to avoid flooding the socket
+        setTimeout(sendRelayChunk, 5);
+      };
+      reader.readAsArrayBuffer(slice);
+    };
+
+    sendRelayChunk();
+    return;
+  }
+
+  // ── WebRTC DataChannel path (original) ──
+  const targets = targetPeerId ? [targetPeerId] : Array.from(dataChannels.keys());
 
   // Send metadata JSON to targets
   targets.forEach(peerId => {
@@ -447,10 +552,8 @@ async function sendFileViaP2P(file, targetPeerId = null) {
   let offset = 0;
   let chunkIndex = 0;
 
-  // Function to transmit chunks
   const readAndSendChunk = () => {
     if (offset >= file.size) {
-      // Transfer complete
       targets.forEach(peerId => {
         const dc = dataChannels.get(peerId);
         if (dc && dc.readyState === 'open') {
@@ -458,14 +561,11 @@ async function sendFileViaP2P(file, targetPeerId = null) {
         }
       });
 
-      showToast(`⚡ P2P Transfer Complete: ${file.name}`, 'success');
-      setTimeout(() => {
-        p2pProgressCard.classList.add('hidden');
-      }, 2000);
+      showToast(`Transfer complete: ${file.name}`, 'success');
+      setTimeout(() => p2pProgressCard.classList.add('hidden'), 2000);
       return;
     }
 
-    // Check backpressure across data channels
     let isBufferedFull = false;
     targets.forEach(peerId => {
       const dc = dataChannels.get(peerId);
@@ -475,7 +575,6 @@ async function sendFileViaP2P(file, targetPeerId = null) {
     });
 
     if (isBufferedFull) {
-      // Pause sending until buffer clears
       setTimeout(readAndSendChunk, 50);
       return;
     }
@@ -486,7 +585,6 @@ async function sendFileViaP2P(file, targetPeerId = null) {
     reader.onload = (e) => {
       const chunkBuffer = e.target.result;
 
-      // Prefix chunk with transferId string (36 bytes)
       const encoder = new TextEncoder();
       const idBytes = encoder.encode(transferId);
       const packet = new Uint8Array(idBytes.byteLength + chunkBuffer.byteLength);
